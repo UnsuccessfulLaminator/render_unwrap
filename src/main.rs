@@ -1,13 +1,13 @@
-use std::ops::Range;
+use std::ops::{MulAssign, Range};
 use std::path::PathBuf;
 use std::fs::File;
-use std::ops::{MulAssign, SubAssign};
+use std::io::{Write, BufWriter};
+use std::process::Command;
 use ndarray::prelude::*;
 use ndarray_npy::ReadNpyExt;
 use ndarray_linalg::LeastSquaresSvd;
-use plotters::prelude::*;
-use plotters::coord::ranged3d::ProjectionMatrix;
 use clap::Parser;
+use tempfile::NamedTempFile;
 
 
 
@@ -61,9 +61,13 @@ struct Args {
     /// Quality threshold, below which points are not plotted
     threshold: f64,
 
-    #[arg(short, long, action)]
-    /// Mirror along the x-axis in 3D space 
-    mirror: bool
+    #[arg(short, long, default_value_t = 1., value_name = "PERIOD")]
+    /// Period over which the color cycle repeats in the z-direction
+    color_period: f64,
+
+    #[arg(long, default_value_t = ("jpeg").to_string())]
+    /// Gnuplot backend to use
+    backend: String
 }
 
 fn parse_range(s: &str) -> Result<Range<f64>, String> {
@@ -90,69 +94,96 @@ fn main() -> anyhow::Result<()> {
     let (h, w) = uphase.dim();
 
     let mut data = vec![];
+    let (mut min_u, mut max_u) = (f64::MAX, f64::MIN);
 
     azip!((index (i, j), &u in &uphase, &q in &quality) {
         if q > args.threshold {
             data.extend([j as f64, i as f64, u, q]);
+
+            if u > max_u { max_u = u; }
+            if u < min_u { min_u = u; }
         }
     });
     
     let n_points = data.len()/4;
     let mut data = Array2::from_shape_vec((n_points, 4), data).unwrap();
     
-    let b = data.slice(s![.., 2]);
-    let mut A = Array2::<f64>::ones((n_points, 5));
+    subtract_fit(data.view_mut());
 
-    A.slice_mut(s![.., ..2]).assign(&data.slice(s![.., ..2]));
-    A.slice_mut(s![.., ..2]).mul_assign(-1.);
-    A.slice_mut(s![.., 3..]).assign(&data.slice(s![.., ..2]));
-    A.slice_mut(s![.., 3]).mul_assign(&data.slice(s![.., 2]));
-    A.slice_mut(s![.., 4]).mul_assign(&data.slice(s![.., 2]));
-
-    let coeffs: Array1<f64> = A.least_squares(&b)?.solution;
-    let fit = A.dot(&coeffs);
-    
-    data.slice_mut(s![.., 2]).sub_assign(&fit);
-
-    let draw = BitMapBackend::new(&args.output, dim).into_drawing_area();
-
-    let cmap = colorous::VIRIDIS;
-    let min = data.rows().into_iter().map(|p| p[2]).reduce(f64::min).unwrap();
-    let max = data.rows().into_iter().map(|p| p[2]).reduce(f64::max).unwrap();
-    let xlim = if args.mirror { (w as f64)..0.0 } else { 0.0..(w as f64) };
+    let cmap = colorous::RAINBOW;
+    let xlim = 0.0..(w as f64);
     let ylim = (h as f64)..0.0;
-    let zlim = args.zlim.unwrap_or(min..max);
-    let mut mat = ProjectionMatrix::default();
-    let mut chart = ChartBuilder::on(&draw)
-        .margin(20)
-        .build_cartesian_3d(xlim, ylim, zlim.clone())?;
+    let zlim = args.zlim.unwrap_or(min_u..max_u);
+    
+    let data_file = NamedTempFile::new_in("")?;
+    let mut plot_file = NamedTempFile::new_in("")?;
+    let mut writer = BufWriter::new(&data_file);
 
-    chart.with_projection(|p| {
-        mat = p.into_matrix();
-        mat
-    });
+    for p in data.rows() {
+        let (x, y, z, q) = (p[0], p[1], p[2], p[3]);
+        let mut color = cmap.eval_continuous((z/args.color_period).rem_euclid(1.));
 
-    let mut markers: Vec<_> = data.rows()
-        .into_iter()
-        .map(|p| {
-            let color = cmap.eval_continuous((p[2]-zlim.start)/(zlim.end-zlim.start));
-            let style = ShapeStyle {
-                color: RGBAColor(color.r, color.g, color.b, 1.),
-                filled: true,
-                stroke_width: 0
-            };
-            let (x, y, z) = (p[0], p[1], p[2]);
-            let depth = mat.projected_depth((x as i32, y as i32, z as i32));
+        writeln!(writer, "{x} {z} {y} 0x{color:X}")?;
+    }
+    
+    drop(writer);
 
-            (Circle::new((x, y, z), 1, style), depth)
-        })
-        .collect();
+    let data_path = data_file.into_temp_path();
+    
+    // General plot configuration
+    writeln!(plot_file, "set term {} size {},{}", args.backend, dim.0, dim.1)?;
+    writeln!(plot_file, "set output '{}'", args.output.display())?;
+    writeln!(plot_file, "set xrange [{}:{}]", xlim.start, xlim.end)?;
+    writeln!(plot_file, "set zrange [{}:{}]", ylim.start, ylim.end)?;
+    writeln!(plot_file, "set yrange [{}:{}]", zlim.start, zlim.end)?;
+    writeln!(plot_file, "set xlabel 'x'; set ylabel 'depth'; set zlabel 'y'")?;
+    writeln!(plot_file, "set view 75, 20")?;
+    writeln!(plot_file, "set xyplane 0")?;
+    writeln!(plot_file, "set multiplot")?;
+    writeln!(plot_file, "set nokey")?;
+    
+    // Plot x-y axes with a grid for the model to sit on
+    writeln!(plot_file, "unset border")?;
+    writeln!(plot_file, "set isosamples 2")?;
+    writeln!(plot_file, "set grid xtics ytics ztics")?;
+    writeln!(plot_file, "set tics offset screen 0,-0.01")?;
+    writeln!(plot_file, "splot {} lc 'black'", ylim.start)?;
+    
+    // Plot the point cloud model with no additional axes
+    writeln!(plot_file, "set hidden3d")?;
+    writeln!(plot_file, "unset xtics; unset ytics; unset grid; unset parametric")?;
+    writeln!(plot_file, "splot '{}' lc rgb variable pt 7 ps 0.2", data_path.display())?;
 
-    markers.sort_unstable_by_key(|m| m.1);
+    let plot_path = plot_file.into_temp_path();
 
-    draw.fill(&WHITE)?;
-    chart.configure_axes().draw()?;
-    chart.draw_series(markers.into_iter().map(|m| m.0))?;
+    Command::new("gnuplot")
+        .args([&plot_path])
+        .status()?;
 
     Ok(())
+}
+
+// Fit the equation z = (ax2+bx+c)/(dx2+ex+1) to the given array of points,
+// which is a good approximation to the general equation for the phase image
+// produced by a plane target. Subtract this fit from the array.
+// Each row of `points` is [x, y, z].
+fn subtract_fit(mut points: ArrayViewMut2<f64>) {
+    let xy = points.slice(s![.., ..2]);
+    let z = points.slice(s![.., 2]);
+    let mut matrix = Array2::<f64>::ones((points.nrows(), 5)); // [[-x, -y, 1, xz, yz], ...]
+    
+    matrix.slice_mut(s![.., ..2]).assign(&xy);
+    matrix.slice_mut(s![.., ..2]).mul_assign(-1.);
+    matrix.slice_mut(s![.., 3..]).assign(&xy);
+    matrix.slice_mut(s![.., 3]).mul_assign(&z);
+    matrix.slice_mut(s![.., 4]).mul_assign(&z);
+
+    let coeffs: Array1<f64> = matrix.least_squares(&z)
+        .expect("Could not find least squares fit for given points")
+        .solution;
+
+    let fit = matrix.dot(&coeffs);
+    let mut z = points.slice_mut(s![.., 2]);
+    
+    z -= &fit;
 }

@@ -12,4 +12,4 @@ colorous = "1.0.12"
 ndarray = "0.15.6"
 ndarray-linalg = { version = "0.16.0", features = ["openblas-system"] }
 ndarray-npy = "0.8.1"
-plotters = "0.3.5"
+tempfile = "3.8.0"
