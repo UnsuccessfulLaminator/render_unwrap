@@ -39,6 +39,14 @@ impl std::fmt::Display for Dimensions {
 }
 
 #[derive(Parser)]
+/// Produce a nice plot of unwrapped phase data by fitting and removing an
+/// underlying plane.
+///
+/// Imaging a plane using a double-slit pattern and a perspective camera gives
+/// a phase image of the form f(x,y) = (ax+by+c)/(dx+by+1). First, we perform a
+/// least-squares fit of this equation, then subtract that fit from the data.
+/// The data is shifted by a constant so that its mean is 0 before being plotted.
+/// Plotting is done with gnuplot.
 struct Args {
     /// Input unwrapped phase
     unwrapped: PathBuf,
@@ -64,6 +72,11 @@ struct Args {
     #[arg(short, long, default_value_t = 1., value_name = "PERIOD")]
     /// Period over which the color cycle repeats in the z-direction
     color_period: f64,
+
+    #[arg(short, long, num_args = 5, value_name = "COEFFS", allow_hyphen_values = true)]
+    /// The fit coefficients a, b, c, d, and e, which will be generated from the
+    /// data if not supplied (see --help text)
+    fit_coefficients: Option<Vec<f64>>,
 
     #[arg(long, default_value_t = ("jpeg").to_string())]
     /// Gnuplot backend to use
@@ -108,7 +121,28 @@ fn main() -> anyhow::Result<()> {
     let n_points = data.len()/4;
     let mut data = Array2::from_shape_vec((n_points, 4), data).unwrap();
     
-    subtract_fit(data.view_mut());
+    let coeffs = if let Some(coeffs) = args.fit_coefficients {
+        Array1::<f64>::from_vec(coeffs)
+    }
+    else {
+        let coeffs = plane_fit(data.view());
+
+        println!("Successfully fit (ax+by+c)/(dx+ey+1) to the data with:");
+        
+        for (c, v) in ('a'..='e').zip(&coeffs) {
+            println!("  {c} = {v}");
+        }
+
+        coeffs
+    };
+
+    for mut p in data.rows_mut() {
+        p[2] -= (coeffs[0]*p[0]+coeffs[1]*p[1]+coeffs[2])/(coeffs[3]*p[0]+coeffs[4]*p[1]+1.);
+    }
+
+    let mut zs = data.slice_mut(s![.., 2]);
+
+    zs -= zs.mean().unwrap();
 
     let cmap = colorous::RAINBOW;
     let xlim = 0.0..(w as f64);
@@ -120,8 +154,8 @@ fn main() -> anyhow::Result<()> {
     let mut writer = BufWriter::new(&data_file);
 
     for p in data.rows() {
-        let (x, y, z, q) = (p[0], p[1], p[2], p[3]);
-        let mut color = cmap.eval_continuous((z/args.color_period).rem_euclid(1.));
+        let (x, y, z) = (p[0], p[1], p[2]);
+        let color = cmap.eval_continuous((z/args.color_period).rem_euclid(1.));
 
         writeln!(writer, "{x} {z} {y} 0x{color:X}")?;
     }
@@ -136,7 +170,9 @@ fn main() -> anyhow::Result<()> {
     writeln!(plot_file, "set xrange [{}:{}]", xlim.start, xlim.end)?;
     writeln!(plot_file, "set zrange [{}:{}]", ylim.start, ylim.end)?;
     writeln!(plot_file, "set yrange [{}:{}]", zlim.start, zlim.end)?;
-    writeln!(plot_file, "set xlabel 'x'; set ylabel 'depth'; set zlabel 'y'")?;
+    writeln!(plot_file, "set xlabel 'x / pixels' offset screen 0,-0.02")?;
+    writeln!(plot_file, "set ylabel 'depth / rad' offset screen 0,-0.02")?;
+    writeln!(plot_file, "set zlabel 'y / pixels' rotate")?;
     writeln!(plot_file, "set view 75, 20")?;
     writeln!(plot_file, "set xyplane 0")?;
     writeln!(plot_file, "set multiplot")?;
@@ -163,27 +199,23 @@ fn main() -> anyhow::Result<()> {
     Ok(())
 }
 
-// Fit the equation z = (ax2+bx+c)/(dx2+ex+1) to the given array of points,
+// Fit the equation z = (ax+by+c)/(dx+ey+1) to the given array of points,
 // which is a good approximation to the general equation for the phase image
 // produced by a plane target. Subtract this fit from the array.
 // Each row of `points` is [x, y, z].
-fn subtract_fit(mut points: ArrayViewMut2<f64>) {
+// Returns the fit coefficients [a, b, c, d, e].
+fn plane_fit(points: ArrayView2<f64>) -> Array1<f64> {
     let xy = points.slice(s![.., ..2]);
     let z = points.slice(s![.., 2]);
     let mut matrix = Array2::<f64>::ones((points.nrows(), 5)); // [[-x, -y, 1, xz, yz], ...]
     
     matrix.slice_mut(s![.., ..2]).assign(&xy);
-    matrix.slice_mut(s![.., ..2]).mul_assign(-1.);
     matrix.slice_mut(s![.., 3..]).assign(&xy);
     matrix.slice_mut(s![.., 3]).mul_assign(&z);
     matrix.slice_mut(s![.., 4]).mul_assign(&z);
+    matrix.slice_mut(s![.., 3..]).mul_assign(-1.);
 
-    let coeffs: Array1<f64> = matrix.least_squares(&z)
+    matrix.least_squares(&z)
         .expect("Could not find least squares fit for given points")
-        .solution;
-
-    let fit = matrix.dot(&coeffs);
-    let mut z = points.slice_mut(s![.., 2]);
-    
-    z -= &fit;
+        .solution
 }
